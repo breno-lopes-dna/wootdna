@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
+const FormData = require('form-data'); // Biblioteca necessária para upload
 
 const app = express();
 app.use(bodyParser.json());
@@ -24,62 +25,57 @@ const ZAPI_CLIENT_TOKEN = (process.env.ZAPI_CLIENT_TOKEN || "").trim();
 const ZAPI_BASE_URL = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}`;
 
 // =======================================================================
-// ROTA 1: ENTRADA (Z-API -> CHATWOOT)
+// ROTA 1: ENTRADA (Z-API -> CHATWOOT) - COM UPLOAD REAL
 // =======================================================================
 app.post('/webhook/zapi', async (req, res) => {
     res.status(200).send('Webhook recebido');
 
     try {
         const data = req.body;
-        // Ignora status de entrega e grupos
         if (data.type !== 'ReceivedCallback' || data.isGroup) return;
 
         const phone = data.phone;
-        
-        // --- 1. DETECÇÃO DE CONTEÚDO (Multimídia) ---
-        let finalMessage = '';
-        let attachmentUrl = ''; // Futuro: se quiser baixar e enviar nativo (não implementado aqui para leveza)
-
-        // Prioridade: Texto > Áudio > Imagem > Documento > Vídeo
-        if (data.text) {
-            if (typeof data.text === 'string') finalMessage = data.text;
-            else if (data.text.message) finalMessage = data.text.message;
-        }
-
-        if (!finalMessage && data.audio) {
-            finalMessage = `🎤 Áudio Recebido: ${data.audio.audioUrl}`;
-        }
-
-        if (!finalMessage && data.image) {
-            finalMessage = `📷 Imagem Recebida: ${data.image.imageUrl}`;
-            if (data.image.caption) finalMessage += `\nLegenda: ${data.image.caption}`;
-        }
-
-        if (!finalMessage && data.video) {
-            finalMessage = `🎥 Vídeo Recebido: ${data.video.videoUrl}`;
-            if (data.video.caption) finalMessage += `\nLegenda: ${data.video.caption}`;
-        }
-
-        if (!finalMessage && data.document) {
-            finalMessage = `📄 Documento Recebido: ${data.document.documentUrl}`;
-            if (data.document.caption) finalMessage += `\nNome: ${data.document.caption}`;
-        }
-
-        if (!finalMessage && data.sticker) {
-            finalMessage = `🤡 Figurinha Recebida: ${data.sticker.stickerUrl}`;
-        }
-
-        if (!finalMessage) {
-            console.log(`⚠️ Tipo de mensagem desconhecido de ${phone}.`);
-            return;
-        }
-
         const senderName = data.senderName || `Cliente ${phone}`;
+        
+        // Variáveis para processamento
+        let textContent = '';
+        let attachmentUrl = null;
+        let attachmentName = 'file';
+
+        // 1. Detectar Tipo de Conteúdo
+        if (data.text) {
+            textContent = (typeof data.text === 'string') ? data.text : data.text.message;
+        } 
+        else if (data.audio) {
+            attachmentUrl = data.audio.audioUrl;
+            attachmentName = 'audio.ogg'; // WhatsApp usa OGG/Opus geralmente
+            textContent = ''; // Chatwoot aceita anexo sem texto
+        } 
+        else if (data.image) {
+            attachmentUrl = data.image.imageUrl;
+            attachmentName = 'image.jpeg';
+            textContent = data.image.caption || '';
+        } 
+        else if (data.document) {
+            attachmentUrl = data.document.documentUrl;
+            attachmentName = data.document.fileName || 'document.pdf';
+            textContent = data.document.caption || '';
+        }
+        else if (data.video) {
+            attachmentUrl = data.video.videoUrl;
+            attachmentName = 'video.mp4';
+            textContent = data.video.caption || '';
+        }
+
+        // Se não tiver nem texto nem anexo, ignora
+        if (!textContent && !attachmentUrl) return;
+
+        console.log(`🔄 Processando mensagem de ${senderName}...`);
+
         let finalSourceId = null;
 
-        // --- 2. LÓGICA DE CONTATO/CONVERSA ---
+        // 2. Lógica de Contato (Busca ou Cria)
         try {
-            // Tenta criar contato
             const createRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                 inbox_id: CHATWOOT_INBOX_ID,
                 name: senderName,
@@ -87,7 +83,6 @@ app.post('/webhook/zapi', async (req, res) => {
             }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
             finalSourceId = createRes.data.payload.contact_inbox.source_id;
         } catch (err) {
-            // Se já existe, busca e vincula
             if (err.response && (err.response.status === 422 || err.response.data?.message?.includes('taken'))) {
                 const searchRes = await axios.get(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${phone}`, { 
                     headers: { 'api_access_token': CHATWOOT_TOKEN } 
@@ -109,7 +104,7 @@ app.post('/webhook/zapi', async (req, res) => {
 
         if (!finalSourceId) return;
 
-        // Garante conversa aberta
+        // 3. Garantir Conversa
         const convRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
             source_id: finalSourceId,
             inbox_id: CHATWOOT_INBOX_ID,
@@ -118,22 +113,54 @@ app.post('/webhook/zapi', async (req, res) => {
 
         const conversationId = convRes.data.id;
 
-        // Envia para o Chatwoot
-        await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`, {
-            content: finalMessage,
-            message_type: 'incoming',
-            private: false
-        }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
-        
-        console.log(`📥 [Entrada] Mídia/Texto de ${phone} entregue.`);
+        // 4. Enviar Mensagem (Com ou Sem Anexo)
+        const messagesUrl = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
+
+        if (attachmentUrl) {
+            // --- MODO UPLOAD (Download da Z-API -> Upload Chatwoot) ---
+            console.log(`📥 Baixando arquivo: ${attachmentUrl}`);
+            
+            try {
+                // Baixa o arquivo como stream
+                const fileResponse = await axios.get(attachmentUrl, { responseType: 'stream' });
+                
+                // Prepara o formulário Multipart
+                const form = new FormData();
+                form.append('content', textContent);
+                form.append('message_type', 'incoming');
+                form.append('private', 'false');
+                form.append('attachments[]', fileResponse.data, attachmentName);
+
+                // Envia para o Chatwoot com os headers corretos do form-data
+                await axios.post(messagesUrl, form, {
+                    headers: {
+                        'api_access_token': CHATWOOT_TOKEN,
+                        ...form.getHeaders()
+                    }
+                });
+                console.log("✅ Arquivo enviado para o Chatwoot!");
+
+            } catch (fileErr) {
+                console.error("❌ Erro ao baixar/enviar arquivo:", fileErr.message);
+            }
+
+        } else {
+            // --- MODO TEXTO SIMPLES ---
+            await axios.post(messagesUrl, {
+                content: textContent,
+                message_type: 'incoming',
+                private: false
+            }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
+            console.log("✅ Texto enviado para o Chatwoot!");
+        }
 
     } catch (error) {
-        console.error("❌ Erro Entrada:", error.message);
+        console.error("❌ Erro Geral:", error.message);
     }
 });
 
 // =======================================================================
-// ROTA 2: SAÍDA (CHATWOOT -> Z-API) - COM SUPORTE A MÍDIA
+// ROTA 2: SAÍDA (CHATWOOT -> Z-API) - MANTIDA IGUAL A V9
 // =======================================================================
 app.post('/webhook/chatwoot', async (req, res) => {
     res.status(200).send('Enviando...'); 
@@ -141,83 +168,64 @@ app.post('/webhook/chatwoot', async (req, res) => {
     try {
         const data = req.body;
         
-        // Filtra eventos de mensagem criada pelo atendente (outgoing) e que não seja privada
         if (data.event === 'message_created' && 
             data.message_type === 'outgoing' && 
             !data.private) {
 
-            // --- 1. DESCOBRIR O TELEFONE ---
+            const content = data.content;
             let phone = '';
+            
             if (data.conversation && data.conversation.contact_inbox && data.conversation.contact_inbox.contact) {
                  phone = data.conversation.contact_inbox.contact.phone_number;
             } else if (data.conversation && data.conversation.meta && data.conversation.meta.sender) {
                 phone = data.conversation.meta.sender.phone_number;
             }
 
-            if (!phone) {
-                console.log("⚠️ Saída ignorada: Telefone não encontrado.");
-                return;
-            }
-            phone = phone.replace(/\D/g, ''); // Limpa o número
+            if (!phone) return;
+            phone = phone.replace(/\D/g, ''); 
 
-            // --- 2. PREPARAR HEADERS ---
             const headers = { 'Content-Type': 'application/json' };
             if (ZAPI_CLIENT_TOKEN) headers['Client-Token'] = ZAPI_CLIENT_TOKEN;
 
-            // --- 3. VERIFICAR SE TEM ANEXO (FOTO/ÁUDIO/DOC) ---
             const attachments = data.attachments;
-            const contentText = data.content || "";
-
+            
             if (attachments && attachments.length > 0) {
-                // Loop para enviar cada anexo (geralmente é 1 por vez no Chatwoot)
                 for (const attachment of attachments) {
                     const fileUrl = attachment.data_url;
-                    const fileType = attachment.file_type; // 'image', 'audio', 'video', 'file'
+                    const fileType = attachment.file_type;
                     
-                    console.log(`📤 Enviando Anexo (${fileType}) para ${phone}...`);
+                    let endpoint = '/send-document';
+                    let payload = { phone: phone, document: fileUrl, extension: 'file' };
 
-                    let endpoint = '/send-document'; // Padrão
-                    let payload = {
-                        phone: phone,
-                        document: fileUrl,
-                        extension: fileUrl.split('.').pop() || "file"
-                    };
-
-                    // Ajusta endpoint e payload conforme o tipo
                     if (fileType === 'image') {
                         endpoint = '/send-image';
-                        payload = { phone: phone, image: fileUrl, caption: contentText };
+                        payload = { phone: phone, image: fileUrl, caption: content };
                     } else if (fileType === 'audio') {
                         endpoint = '/send-audio';
                         payload = { phone: phone, audio: fileUrl };
                     } else if (fileType === 'video') {
                         endpoint = '/send-video';
-                        payload = { phone: phone, video: fileUrl, caption: contentText };
+                        payload = { phone: phone, video: fileUrl, caption: content };
                     }
 
-                    // Envia para Z-API
                     await axios.post(`${ZAPI_BASE_URL}${endpoint}`, payload, { headers: headers })
-                        .then(() => console.log(`✅ Anexo (${fileType}) enviado com sucesso!`))
-                        .catch(err => console.error(`❌ Erro envio anexo: ${JSON.stringify(err.response?.data)}`));
+                        .catch(err => console.error(`❌ Z-API Erro Anexo: ${JSON.stringify(err.response?.data)}`));
                 }
             } 
-            // --- 4. SE NÃO TEM ANEXO, É TEXTO PURO ---
-            else if (contentText) {
-                console.log(`📤 Enviando Texto para ${phone}: ${contentText}`);
+            else if (content) {
                 await axios.post(`${ZAPI_BASE_URL}/send-text`, {
                     phone: phone,
-                    message: contentText
+                    message: content
                 }, { headers: headers })
-                .then(res => console.log(`✅ Texto enviado!`))
-                .catch(err => console.error(`❌ Erro envio texto: ${JSON.stringify(err.response?.data)}`));
+                .catch(err => console.error(`❌ Z-API Erro Texto: ${JSON.stringify(err.response?.data)}`));
             }
         }
     } catch (error) {
-        console.error("❌ Erro Geral Saída:", error.message);
+        console.error("❌ Erro Saída:", error.message);
     }
 });
 
-app.get('/', (req, res) => res.send('Middleware v9 (Full Media Support) Online 🟢'));
+app.get('/', (req, res) => res.send('Middleware v10 (Native Attachments) Online 🟢'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
