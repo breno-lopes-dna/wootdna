@@ -5,7 +5,7 @@ const axios = require('axios');
 const app = express();
 app.use(bodyParser.json());
 
-// --- CONFIGURAÇÕES E CORREÇÃO AUTOMÁTICA DE URL ---
+// --- CONFIGURAÇÕES CHATWOOT ---
 let rawUrl = process.env.CHATWOOT_URL || "";
 if (rawUrl.endsWith('/')) rawUrl = rawUrl.slice(0, -1);
 rawUrl = rawUrl.replace("https://https://", "https://");
@@ -17,14 +17,19 @@ const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || 1;
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || 1;
 
+// --- CONFIGURAÇÕES Z-API ---
+const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
+const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+const ZAPI_URL = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`;
+
+// =======================================================================
+// ROTA 1: ENTRADA (Z-API -> CHATWOOT)
+// =======================================================================
 app.post('/webhook/zapi', async (req, res) => {
-    // Responde OK rápido
     res.status(200).send('Webhook recebido');
 
     try {
         const data = req.body;
-        
-        // Filtros
         if (data.type !== 'ReceivedCallback' || data.isGroup) return;
 
         const phone = data.phone;
@@ -35,72 +40,39 @@ app.post('/webhook/zapi', async (req, res) => {
         if (!text) return;
 
         const senderName = data.senderName || `Cliente ${phone}`;
-        console.log(`🔄 Processando msg de: ${senderName}`);
-
         let finalSourceId = null;
 
-        // --- LÓGICA DE CONTATO (BLINDADA) ---
-        // 1. Tenta criar o contato
+        // 1. Lógica de Contato (Busca ou Cria)
         try {
-            console.log("🔍 Tentando criar contato...");
             const createRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                 inbox_id: CHATWOOT_INBOX_ID,
                 name: senderName,
                 phone_number: `+${phone}`
             }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
-
             finalSourceId = createRes.data.payload.contact_inbox.source_id;
-            console.log(`✅ Contato criado. Source ID: ${finalSourceId}`);
-
         } catch (err) {
-            // Se der erro 422, o contato JÁ EXISTE. Vamos buscá-lo.
             if (err.response && (err.response.status === 422 || err.response.data?.message?.includes('taken'))) {
-                console.log("⚠️ Contato já existe. Buscando ID Global...");
-                
-                // Busca pelo telefone
                 const searchRes = await axios.get(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${phone}`, { 
                     headers: { 'api_access_token': CHATWOOT_TOKEN } 
                 });
-
                 if (searchRes.data.payload.length > 0) {
                     const contact = searchRes.data.payload[0];
-                    const globalContactId = contact.id;
-
-                    // Verifica se já tem vinculo com ESTA caixa
                     const inboxLink = contact.contact_inboxes.find(i => i.inbox_id == CHATWOOT_INBOX_ID);
-                    
                     if (inboxLink) {
                         finalSourceId = inboxLink.source_id;
-                        console.log(`✅ Vínculo existente encontrado: ${finalSourceId}`);
                     } else {
-                        // [CORREÇÃO AQUI]
-                        // O contato existe, mas não nesta caixa. Criamos apenas o VÍNCULO (ContactInbox).
-                        console.log(`➕ Criando vínculo do contato ${globalContactId} com a caixa ${CHATWOOT_INBOX_ID}...`);
-                        
-                        const linkRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${globalContactId}/contact_inboxes`, {
+                        const linkRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${contact.id}/contact_inboxes`, {
                             inbox_id: CHATWOOT_INBOX_ID
                         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
-                        
                         finalSourceId = linkRes.data.source_id;
-                        console.log(`✅ Vínculo criado com sucesso. Source ID: ${finalSourceId}`);
                     }
-                } else {
-                    console.error("❌ Erro estranho: Diz que existe mas a busca não achou.");
-                    return;
                 }
-            } else {
-                console.error("❌ Erro ao criar contato:", err.response?.data || err.message);
-                return;
             }
         }
 
-        if (!finalSourceId) {
-            console.error("❌ Falha crítica: Não consegui obter o Source ID.");
-            return;
-        }
+        if (!finalSourceId) return;
 
-        // 2. Criar a Conversa
-        console.log(`💬 Criando conversa...`);
+        // 2. Conversa e Mensagem
         const convRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
             source_id: finalSourceId,
             inbox_id: CHATWOOT_INBOX_ID,
@@ -108,23 +80,71 @@ app.post('/webhook/zapi', async (req, res) => {
         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
 
         const conversationId = convRes.data.id;
-        console.log(`📝 Conversa criada: ID ${conversationId}`);
 
-        // 3. Enviar a Mensagem
         await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`, {
             content: text,
             message_type: 'incoming',
             private: false
         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
         
-        console.log("🚀 SUCESSO! Mensagem entregue.");
+        console.log(`📥 Recebido de ${phone}: ${text}`);
 
     } catch (error) {
-        console.error("❌ Erro Geral:", error.response?.data || error.message);
+        console.error("❌ Erro Entrada:", error.message);
     }
 });
 
-app.get('/', (req, res) => res.send('Middleware v5 (Anti-Duplicate Fix) Online'));
+// =======================================================================
+// ROTA 2: SAÍDA (CHATWOOT -> Z-API)
+// =======================================================================
+app.post('/webhook/chatwoot', async (req, res) => {
+    res.status(200).send('Enviando...'); // Chatwoot espera 200 rápido
+
+    try {
+        const data = req.body;
+        
+        // Verifica se é uma mensagem criada, se é de saída (outgoing) e se não é privada (nota interna)
+        if (data.event === 'message_created' && 
+            data.message_type === 'outgoing' && 
+            !data.private) {
+
+            const content = data.content;
+            
+            // O Chatwoot manda o telefone do contato dentro de 'conversation' -> 'meta' -> 'sender'
+            // OU dentro de 'contact' -> 'phone_number'
+            // Vamos tentar pegar de forma segura
+            let phone = '';
+            
+            // Tenta pegar do contato direto
+            if (data.conversation && data.conversation.contact_inbox && data.conversation.contact_inbox.contact) {
+                 phone = data.conversation.contact_inbox.contact.phone_number;
+            } 
+            // Fallback: tenta pegar da meta da conversa
+            else if (data.conversation && data.conversation.meta && data.conversation.meta.sender) {
+                phone = data.conversation.meta.sender.phone_number;
+            }
+
+            // Limpa o telefone (remove o + e caracteres especiais para a Z-API)
+            if (phone) {
+                phone = phone.replace(/\D/g, ''); // Remove tudo que não é número
+                
+                console.log(`📤 Enviando para ${phone}: ${content}`);
+
+                // Envia para Z-API
+                await axios.post(ZAPI_URL, {
+                    phone: phone,
+                    message: content
+                });
+            } else {
+                console.log("⚠️ Tentativa de envio sem telefone detectado.");
+            }
+        }
+    } catch (error) {
+        console.error("❌ Erro Saída:", error.message);
+    }
+});
+
+app.get('/', (req, res) => res.send('Middleware Completo (Entrada + Saída) Online 🟢'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
