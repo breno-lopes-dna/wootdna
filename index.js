@@ -6,81 +6,104 @@ const app = express();
 app.use(bodyParser.json());
 
 // --- CONFIGURAÇÕES (Vêm das Variáveis de Ambiente do Coolify) ---
-const CHATWOOT_URL = process.env.CHATWOOT_URL; // Ex: http://chatwoot-rails:3000 (Rede Interna)
-const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN; // Token do seu perfil
+const CHATWOOT_URL = process.env.CHATWOOT_URL; // Ex: http://chatwoot:3000 ou https://seu-site.com
+const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || 1;
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || 1;
 
-// --- ROTA QUE RECEBE DA Z-API ---
+// --- ROTA DO WEBHOOK (Z-API) ---
 app.post('/webhook/zapi', async (req, res) => {
+    // [IMPORTANTE] Responde imediatamente para a Z-API não dar erro de timeout
+    res.status(200).send('Webhook recebido com sucesso');
+
+    // O processamento acontece em segundo plano (Assíncrono)
     try {
         const data = req.body;
-        console.log("Recebido da Z-API:", JSON.stringify(data));
 
-        // Filtra apenas mensagens de texto recebidas (ignora status, grupos, etc por enquanto)
-        // Você pode expandir isso depois para aceitar imagem/áudio
+        // Log para debug no Coolify
+        console.log("📥 Payload recebido da Z-API:", JSON.stringify(data));
+
+        // Filtro: Processa apenas mensagens de texto recebidas (ReceivedCallback)
+        // Ignora mensagens de grupos (!data.isGroup)
         if (data.type === 'ReceivedCallback' && !data.isGroup) {
-            const phone = data.phone; // Número do cliente
-            const text = data.text;   // Texto da mensagem
-            const senderName = data.senderName || phone;
+            
+            const phone = data.phone; 
+            const text = data.text;
+            // Se não vier nome, usa o telefone como nome
+            const senderName = data.senderName || `Cliente ${phone}`;
 
-            // 1. Procurar Contato no Chatwoot
+            // Validação de segurança
+            if (!phone || !text) {
+                console.log("⚠️ Mensagem ignorada: Telefone ou texto vazios.");
+                return;
+            }
+
+            console.log(`🔄 Processando mensagem de: ${senderName} (${phone})`);
+
+            // --- PASSO 1: Buscar Contato no Chatwoot ---
             let contactId;
             const searchUrl = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${phone}`;
             
             try {
-                const searchRes = await axios.get(searchUrl, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
+                const searchRes = await axios.get(searchUrl, { 
+                    headers: { 'api_access_token': CHATWOOT_TOKEN } 
+                });
                 
                 if (searchRes.data.payload && searchRes.data.payload.length > 0) {
                     contactId = searchRes.data.payload[0].id;
-                    console.log(`Contato existente encontrado: ${contactId}`);
+                    console.log(`✅ Contato existente encontrado (ID: ${contactId})`);
                 } else {
-                    // 2. Se não existir, Criar Contato
-                    console.log("Criando novo contato...");
+                    // --- PASSO 2: Criar Contato se não existir ---
+                    console.log("🆕 Criando novo contato...");
                     const createContactRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                         inbox_id: CHATWOOT_INBOX_ID,
                         name: senderName,
                         phone_number: `+${phone}`
                     }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
+                    
                     contactId = createContactRes.data.payload.contact.id;
+                    console.log(`✅ Novo contato criado (ID: ${contactId})`);
                 }
-            } catch (err) {
-                console.error("Erro ao buscar/criar contato:", err.response?.data || err.message);
-                // Se der erro aqui, tentamos prosseguir ou abortamos. Vamos abortar para não perder msg.
-                return res.status(500).send("Erro ao processar contato no Chatwoot");
-            }
 
-            // 3. Criar Conversa (Se já existir aberta, o Chatwoot anexa, se não, cria nova)
-            console.log(`Enviando mensagem para contato ${contactId}...`);
-            await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
-                source_id: contactId,
-                inbox_id: CHATWOOT_INBOX_ID,
-                status: 'open' // Garante que reabre se estiver fechada
-            }, { headers: { 'api_access_token': CHATWOOT_TOKEN } })
-            .then(async (convRes) => {
+                // --- PASSO 3: Garantir Conversa Aberta ---
+                // Cria ou recupera conversa existente
+                const convRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
+                    source_id: contactId,
+                    inbox_id: CHATWOOT_INBOX_ID,
+                    status: 'open'
+                }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
+
                 const conversationId = convRes.data.id;
-                
-                // 4. Inserir a Mensagem na Conversa
+                console.log(`💬 ID da Conversa: ${conversationId}`);
+
+                // --- PASSO 4: Enviar a Mensagem ---
                 await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`, {
                     content: text,
-                    message_type: 'incoming', // Importante: Diz pro Chatwoot que veio do cliente
+                    message_type: 'incoming', // Define que é mensagem de ENTRADA (cliente)
                     private: false
                 }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
                 
-                console.log("Mensagem entregue com sucesso!");
-            });
+                console.log("🚀 SUCESSO: Mensagem entregue ao Chatwoot!");
+
+            } catch (apiError) {
+                console.error("❌ Erro na API do Chatwoot:", apiError.response?.data || apiError.message);
+            }
+        } else {
+            // Logs para entender o que está sendo ignorado (ex: status de entrega, grupos)
+            console.log(`ℹ️ Evento ignorado (Tipo: ${data.type}, Grupo: ${data.isGroup})`);
         }
 
-        res.status(200).send('OK');
     } catch (error) {
-        console.error("Erro Geral:", error.message);
-        res.status(500).send('Erro interno');
+        console.error("❌ Erro crítico no servidor:", error.message);
     }
 });
 
-// Rota de teste simples
-app.get('/', (req, res) => res.send('Middleware Z-API rodando!'));
+// Rota de saúde para testar no navegador
+app.get('/', (req, res) => {
+    res.send('<h3>Middleware Z-API > Chatwoot está ONLINE e CORRIGIDO! 🟢</h3>');
+});
 
-app.listen(3000, () => {
-    console.log('Servidor rodando na porta 3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Servidor rodando na porta ${PORT}`);
 });
