@@ -18,12 +18,13 @@ const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || 1;
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || 1;
 
 app.post('/webhook/zapi', async (req, res) => {
+    // Responde OK rápido
     res.status(200).send('Webhook recebido');
 
     try {
         const data = req.body;
         
-        // Validações iniciais
+        // Filtros
         if (data.type !== 'ReceivedCallback' || data.isGroup) return;
 
         const phone = data.phone;
@@ -36,53 +37,59 @@ app.post('/webhook/zapi', async (req, res) => {
         const senderName = data.senderName || `Cliente ${phone}`;
         console.log(`🔄 Processando msg de: ${senderName}`);
 
-        // --- VARIÁVEL MÁGICA: O Source ID ---
         let finalSourceId = null;
 
-        // 1. Tentar CRIAR o contato direto (O Chatwoot lida com duplicados)
-        // Isso garante que pegamos o contact_inbox correto
+        // --- LÓGICA DE CONTATO (BLINDADA) ---
+        // 1. Tenta criar o contato
         try {
-            console.log("🔍 Buscando/Criando contato...");
+            console.log("🔍 Tentando criar contato...");
             const createRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                 inbox_id: CHATWOOT_INBOX_ID,
                 name: senderName,
                 phone_number: `+${phone}`
             }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
 
-            // [CORREÇÃO]: Pegamos o source_id do contact_inbox, não o ID global
             finalSourceId = createRes.data.payload.contact_inbox.source_id;
-            console.log(`✅ Contato identificado. Source ID: ${finalSourceId}`);
+            console.log(`✅ Contato criado. Source ID: ${finalSourceId}`);
 
         } catch (err) {
-            // Se der erro 422, é porque o contato já existe mas talvez não nessa caixa.
-            // Vamos tentar buscar.
-            if (err.response && err.response.status === 422) {
-                console.log("⚠️ Contato já existe. Buscando dados...");
+            // Se der erro 422, o contato JÁ EXISTE. Vamos buscá-lo.
+            if (err.response && (err.response.status === 422 || err.response.data?.message?.includes('taken'))) {
+                console.log("⚠️ Contato já existe. Buscando ID Global...");
+                
+                // Busca pelo telefone
                 const searchRes = await axios.get(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/search?q=${phone}`, { 
                     headers: { 'api_access_token': CHATWOOT_TOKEN } 
                 });
 
                 if (searchRes.data.payload.length > 0) {
                     const contact = searchRes.data.payload[0];
-                    // Procura se ele já tem vinculo com essa caixa
+                    const globalContactId = contact.id;
+
+                    // Verifica se já tem vinculo com ESTA caixa
                     const inboxLink = contact.contact_inboxes.find(i => i.inbox_id == CHATWOOT_INBOX_ID);
                     
                     if (inboxLink) {
                         finalSourceId = inboxLink.source_id;
                         console.log(`✅ Vínculo existente encontrado: ${finalSourceId}`);
                     } else {
-                        // Existe o contato, mas não nessa caixa. Vamos criar o vínculo.
-                        console.log("➕ Criando vínculo com a caixa...");
-                        const linkRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
-                            inbox_id: CHATWOOT_INBOX_ID,
-                            name: senderName,
-                            phone_number: `+${phone}`
+                        // [CORREÇÃO AQUI]
+                        // O contato existe, mas não nesta caixa. Criamos apenas o VÍNCULO (ContactInbox).
+                        console.log(`➕ Criando vínculo do contato ${globalContactId} com a caixa ${CHATWOOT_INBOX_ID}...`);
+                        
+                        const linkRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${globalContactId}/contact_inboxes`, {
+                            inbox_id: CHATWOOT_INBOX_ID
                         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
-                        finalSourceId = linkRes.data.payload.contact_inbox.source_id;
+                        
+                        finalSourceId = linkRes.data.source_id;
+                        console.log(`✅ Vínculo criado com sucesso. Source ID: ${finalSourceId}`);
                     }
+                } else {
+                    console.error("❌ Erro estranho: Diz que existe mas a busca não achou.");
+                    return;
                 }
             } else {
-                console.error("❌ Erro ao criar contato:", err.message);
+                console.error("❌ Erro ao criar contato:", err.response?.data || err.message);
                 return;
             }
         }
@@ -92,10 +99,10 @@ app.post('/webhook/zapi', async (req, res) => {
             return;
         }
 
-        // 2. Criar a Conversa usando o Source ID correto
+        // 2. Criar a Conversa
         console.log(`💬 Criando conversa...`);
         const convRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
-            source_id: finalSourceId, // <--- AQUI ESTAVA O PROBLEMA ANTES
+            source_id: finalSourceId,
             inbox_id: CHATWOOT_INBOX_ID,
             status: 'open'
         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
@@ -117,7 +124,7 @@ app.post('/webhook/zapi', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send('Middleware v4 (Source ID Fix) Online'));
+app.get('/', (req, res) => res.send('Middleware v5 (Anti-Duplicate Fix) Online'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
