@@ -1,7 +1,7 @@
 {
   "name": "zapi-chatwoot-bridge",
   "version": "1.0.0",
-  "description": "Middleware de integração entre Z-API e Chatwoot",
+  "description": "Middleware de integração Z-API e Chatwoot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "axios": "^1.6.2",
     "body-parser": "^1.20.2",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "form-data": "^4.0.0"
   }
 }
