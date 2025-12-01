@@ -17,9 +17,10 @@ const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN;
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || 1;
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || 1;
 
-// --- CONFIGURAÇÕES Z-API ---
-const ZAPI_INSTANCE_ID = process.env.ZAPI_INSTANCE_ID;
-const ZAPI_TOKEN = process.env.ZAPI_TOKEN;
+// --- CONFIGURAÇÕES Z-API (COM LIMPEZA DE ESPAÇOS) ---
+// O .trim() remove espaços em branco acidentais no início ou fim
+const ZAPI_INSTANCE_ID = (process.env.ZAPI_INSTANCE_ID || "").trim();
+const ZAPI_TOKEN = (process.env.ZAPI_TOKEN || "").trim();
 const ZAPI_URL = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}/send-text`;
 
 // =======================================================================
@@ -42,7 +43,7 @@ app.post('/webhook/zapi', async (req, res) => {
         const senderName = data.senderName || `Cliente ${phone}`;
         let finalSourceId = null;
 
-        // 1. Lógica de Contato (Busca ou Cria)
+        // 1. Lógica de Contato
         try {
             const createRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                 inbox_id: CHATWOOT_INBOX_ID,
@@ -98,53 +99,56 @@ app.post('/webhook/zapi', async (req, res) => {
 // ROTA 2: SAÍDA (CHATWOOT -> Z-API)
 // =======================================================================
 app.post('/webhook/chatwoot', async (req, res) => {
-    res.status(200).send('Enviando...'); // Chatwoot espera 200 rápido
+    res.status(200).send('Enviando...'); 
 
     try {
         const data = req.body;
         
-        // Verifica se é uma mensagem criada, se é de saída (outgoing) e se não é privada (nota interna)
         if (data.event === 'message_created' && 
             data.message_type === 'outgoing' && 
             !data.private) {
 
             const content = data.content;
-            
-            // O Chatwoot manda o telefone do contato dentro de 'conversation' -> 'meta' -> 'sender'
-            // OU dentro de 'contact' -> 'phone_number'
-            // Vamos tentar pegar de forma segura
             let phone = '';
             
-            // Tenta pegar do contato direto
             if (data.conversation && data.conversation.contact_inbox && data.conversation.contact_inbox.contact) {
                  phone = data.conversation.contact_inbox.contact.phone_number;
             } 
-            // Fallback: tenta pegar da meta da conversa
             else if (data.conversation && data.conversation.meta && data.conversation.meta.sender) {
                 phone = data.conversation.meta.sender.phone_number;
             }
 
-            // Limpa o telefone (remove o + e caracteres especiais para a Z-API)
             if (phone) {
-                phone = phone.replace(/\D/g, ''); // Remove tudo que não é número
+                // Limpa o telefone para garantir formato Z-API
+                phone = phone.replace(/\D/g, ''); 
                 
-                console.log(`📤 Enviando para ${phone}: ${content}`);
+                console.log(`📤 Tentando enviar via Z-API...`);
+                console.log(`   Destino: ${phone}`);
+                console.log(`   URL: ${ZAPI_URL.replace(ZAPI_TOKEN, '***')}`); // Loga URL sem mostrar token
 
-                // Envia para Z-API
+                // Envia para Z-API e Loga a resposta
                 await axios.post(ZAPI_URL, {
                     phone: phone,
                     message: content
+                })
+                .then(response => {
+                    console.log(`✅ Z-API Respondeu: ${JSON.stringify(response.data)}`);
+                })
+                .catch(err => {
+                    // AQUI ESTÁ O SEGREDO DO ERRO 400
+                    console.error(`❌ Z-API Recusou (Erro ${err.response?.status}):`);
+                    console.error(`   Motivo: ${JSON.stringify(err.response?.data)}`);
                 });
             } else {
-                console.log("⚠️ Tentativa de envio sem telefone detectado.");
+                console.log("⚠️ Telefone não encontrado no evento do Chatwoot.");
             }
         }
     } catch (error) {
-        console.error("❌ Erro Saída:", error.message);
+        console.error("❌ Erro Geral Saída:", error.message);
     }
 });
 
-app.get('/', (req, res) => res.send('Middleware Completo (Entrada + Saída) Online 🟢'));
+app.get('/', (req, res) => res.send('Middleware v6 (Trim + Debug Z-API) Online 🟢'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
