@@ -109,27 +109,17 @@ app.post('/webhook/zapi', async (req, res) => {
         try {
             const currentLabels = convRes.data.labels || [];
             
-            // Verifica se deve ser atendido por IA
             const isHumanAttendance = currentLabels.includes('agente-off') || currentLabels.includes('gestor');
-            
-            // Verifica se JÁ POSSUI a etiqueta (para não aplicar de novo e economizar tempo)
             const hasTriggerLabel = currentLabels.includes('testando-agente');
 
             if (!isHumanAttendance && !hasTriggerLabel) {
-                // SÓ entra aqui se for a primeira mensagem ou se a etiqueta sumiu
                 console.log(`🏷️ Aplicando etiqueta na conversa ${conversationId}...`);
-                
                 await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/labels`, {
                     labels: [...currentLabels, "testando-agente"] 
                 }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
                 
-                // Delay necessário APENAS quando aplicamos a etiqueta agora
                 await delay(500); 
-            } else {
-                // Fluxo rápido: Etiqueta já existe ou é atendimento humano
-                // console.log("⚡ Fluxo rápido (sem delay de etiqueta)");
-            }
-
+            } 
         } catch (labelErr) {
             console.error("⚠️ Erro labels:", labelErr.message);
         }
@@ -172,21 +162,54 @@ app.post('/webhook/zapi', async (req, res) => {
 // ROTA 2: SAÍDA (CHATWOOT -> Z-API)
 // =======================================================================
 app.post('/webhook/chatwoot', async (req, res) => {
-    res.status(200).send('Enviando...');
+    res.status(200).send('Processando...');
+    
     try {
         const data = req.body;
-        if (data.event === 'message_created' && data.message_type === 'outgoing' && !data.private) {
-            let phone = '';
-            if (data.conversation?.contact_inbox?.contact) phone = data.conversation.contact_inbox.contact.phone_number;
-            else if (data.conversation?.meta?.sender) phone = data.conversation.meta.sender.phone_number;
+        const event = data.event;
 
-            if (!phone) return;
-            phone = phone.replace(/\D/g, ''); 
+        // 1. Extração Universal de Telefone
+        let phone = '';
+        if (data.conversation?.contact_inbox?.contact) {
+            phone = data.conversation.contact_inbox.contact.phone_number;
+        } else if (data.conversation?.meta?.sender) {
+            phone = data.conversation.meta.sender.phone_number;
+        } else if (data.sender?.phone_number) { 
+            phone = data.sender.phone_number;
+        }
 
-            const headers = { 'Content-Type': 'application/json' };
-            if (ZAPI_CLIENT_TOKEN) headers['Client-Token'] = ZAPI_CLIENT_TOKEN;
+        if (!phone) return; 
+        phone = phone.replace(/\D/g, ''); 
 
+        const headers = { 'Content-Type': 'application/json' };
+        if (ZAPI_CLIENT_TOKEN) headers['Client-Token'] = ZAPI_CLIENT_TOKEN;
+
+        // 2. Evento: DIGITANDO / GRAVANDO
+        if (event === 'conversation_typing_on') {
+            // Tenta detectar se é gravação de áudio olhando para o payload
+            // O Chatwoot oficial nem sempre envia isso, mas se enviar, vamos usar.
+            const isRecording = data.typing_status === 'recording' || data.status === 'recording';
+            
+            await axios.post(`${ZAPI_BASE_URL}/send-chat-state`, {
+                phone: phone,
+                chatState: isRecording ? "recording" : "composing"
+            }, { headers }).catch(e => console.error("❌ Erro Z-API Chat State:", e.message));
+            return;
+        }
+
+        // 3. Evento: PAROU (Typing Off)
+        if (event === 'conversation_typing_off') {
+            await axios.post(`${ZAPI_BASE_URL}/send-chat-state`, {
+                phone: phone,
+                chatState: "paused"
+            }, { headers }).catch(e => console.error("❌ Erro Z-API Pause:", e.message));
+            return;
+        }
+
+        // 4. Evento: MENSAGEM CRIADA
+        if (event === 'message_created' && data.message_type === 'outgoing' && !data.private) {
             const attachments = data.attachments;
+            
             if (attachments && attachments.length > 0) {
                 for (const attachment of attachments) {
                     const fileUrl = attachment.data_url;
@@ -198,15 +221,20 @@ app.post('/webhook/chatwoot', async (req, res) => {
                     else if (fileType === 'audio') { endpoint = '/send-audio'; payload = { phone, audio: fileUrl }; }
                     else if (fileType === 'video') { endpoint = '/send-video'; payload = { phone, video: fileUrl, caption: data.content }; }
 
-                    await axios.post(`${ZAPI_BASE_URL}${endpoint}`, payload, { headers }).catch(e => console.error("Erro Z-API mídia:", e.message));
+                    await axios.post(`${ZAPI_BASE_URL}${endpoint}`, payload, { headers })
+                        .catch(e => console.error("❌ Erro Z-API Mídia:", e.message));
                 }
             } else if (data.content) {
-                await axios.post(`${ZAPI_BASE_URL}/send-text`, { phone, message: data.content }, { headers }).catch(e => console.error("Erro Z-API texto:", e.message));
+                await axios.post(`${ZAPI_BASE_URL}/send-text`, { phone, message: data.content }, { headers })
+                    .catch(e => console.error("❌ Erro Z-API Texto:", e.message));
             }
         }
-    } catch (error) { console.error("Erro Chatwoot:", error.message); }
+
+    } catch (error) { 
+        console.error("❌ Erro Webhook Chatwoot:", error.message); 
+    }
 });
 
-app.get('/', (req, res) => res.send('Middleware v14 (Optimized Speed) Online'));
+app.get('/', (req, res) => res.send('Middleware v16 (Typing/Recording Support) Online'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
