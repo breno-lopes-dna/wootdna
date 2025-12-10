@@ -35,8 +35,11 @@ app.post('/webhook/zapi', async (req, res) => {
     try {
         const data = req.body;
         
-        // Ignora status de entrega e mensagens de grupo
-        if (data.type !== 'ReceivedCallback' || data.isGroup) return;
+        // [CORREÇÃO CRÍTICA DO LOOP]
+        // data.fromMe: Ignora mensagens enviadas pelo próprio número (o eco)
+        // data.isGroup: Ignora mensagens de grupo
+        // data.type: Aceita apenas mensagens de callback recebidas
+        if (data.fromMe || data.type !== 'ReceivedCallback' || data.isGroup) return;
 
         const phone = data.phone;
         const senderName = data.senderName || `Cliente ${phone}`;
@@ -44,7 +47,7 @@ app.post('/webhook/zapi', async (req, res) => {
         let textContent = '';
         let attachmentUrl = null;
         let attachmentName = 'file.bin';
-        let attachmentMime = 'application/octet-stream'; // Padrão genérico
+        let attachmentMime = 'application/octet-stream'; 
 
         // --- DETECÇÃO AVANÇADA DE TIPO ---
         if (data.text) {
@@ -53,7 +56,7 @@ app.post('/webhook/zapi', async (req, res) => {
         else if (data.audio) {
             attachmentUrl = data.audio.audioUrl;
             attachmentName = 'audio.ogg'; 
-            attachmentMime = 'audio/ogg'; // Força o tipo OGG (padrão WhatsApp)
+            attachmentMime = 'audio/ogg'; 
             textContent = ''; 
         } 
         else if (data.image) {
@@ -65,7 +68,6 @@ app.post('/webhook/zapi', async (req, res) => {
         else if (data.document) {
             attachmentUrl = data.document.documentUrl;
             attachmentName = data.document.fileName || 'document.pdf';
-            // Tenta adivinhar mime simples ou usa pdf
             attachmentMime = attachmentName.endsWith('.pdf') ? 'application/pdf' : 'application/octet-stream';
             textContent = data.document.caption || '';
         }
@@ -106,12 +108,9 @@ app.post('/webhook/zapi', async (req, res) => {
 
         const conversationId = convRes.data.id;
 
-        // 2. [CORREÇÃO] APLICA ETIQUETA ANTES DA MENSAGEM
-        // Isso garante que quando o n8n receber o webhook da mensagem, a etiqueta já exista
+        // 2. APLICA ETIQUETA COM DELAY (Correção de Race Condition)
         try {
             const currentLabels = convRes.data.labels || [];
-            
-            // Verifica se o atendimento já foi assumido por humano ou gestor
             const isHumanAttendance = currentLabels.includes('agente-off') || currentLabels.includes('gestor');
 
             if (!isHumanAttendance) {
@@ -122,58 +121,44 @@ app.post('/webhook/zapi', async (req, res) => {
                 
                 console.log(`🏷️ Etiqueta 'testando-agente' aplicada na conversa ${conversationId}`);
                 
-                // CRÍTICO: Delay para garantir que o banco do Chatwoot processe a etiqueta 
-                // antes de dispararmos a mensagem que aciona o webhook
+                // Delay para garantir que o banco processe a etiqueta antes de enviar a mensagem
                 await delay(500); 
             }
         } catch (labelErr) {
-            console.error("⚠️ Erro ao aplicar etiquetas (fluxo continuará):", labelErr.message);
+            console.error("⚠️ Erro ao aplicar etiquetas:", labelErr.message);
         }
 
-        // 3. ENVIA A MENSAGEM (TEXTO OU MÍDIA)
+        // 3. ENVIA A MENSAGEM
         const messagesUrl = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
 
         if (attachmentUrl) {
-            console.log(`📥 Baixando mídia (${attachmentMime}): ${attachmentUrl}`);
-            
+            console.log(`📥 Baixando mídia...`);
             try {
                 const fileResponse = await axios.get(attachmentUrl, { responseType: 'stream' });
-                
                 const form = new FormData();
                 form.append('content', textContent);
                 form.append('message_type', 'incoming');
                 form.append('private', 'false');
-                
-                // Passando opções de arquivo explícitas para garantir aceitação no Chatwoot
                 form.append('attachments[]', fileResponse.data, {
                     filename: attachmentName,
                     contentType: attachmentMime,
                     knownLength: fileResponse.headers['content-length']
                 });
-
                 await axios.post(messagesUrl, form, {
-                    headers: {
-                        'api_access_token': CHATWOOT_TOKEN,
-                        ...form.getHeaders()
-                    },
-                    maxContentLength: Infinity,
-                    maxBodyLength: Infinity
+                    headers: { 'api_access_token': CHATWOOT_TOKEN, ...form.getHeaders() },
+                    maxContentLength: Infinity, maxBodyLength: Infinity
                 });
-                console.log("✅ Arquivo enviado com sucesso!");
-
-            } catch (fileErr) {
-                console.error("❌ Erro upload de arquivo:", fileErr.message);
-            }
-
+                console.log("✅ Arquivo enviado!");
+            } catch (fileErr) { console.error("❌ Erro upload:", fileErr.message); }
         } else {
             await axios.post(messagesUrl, {
                 content: textContent, message_type: 'incoming', private: false
             }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
-            console.log("✅ Texto enviado com sucesso!");
+            console.log("✅ Texto enviado!");
         }
 
     } catch (error) {
-        console.error("❌ Erro Geral no Webhook Z-API:", error.message);
+        console.error("❌ Erro Geral:", error.message);
     }
 });
 
@@ -203,20 +188,19 @@ app.post('/webhook/chatwoot', async (req, res) => {
                     let endpoint = '/send-document';
                     let payload = { phone: phone, document: fileUrl, extension: 'file' };
 
-                    // Mapeamento correto de endpoints da Z-API
                     if (fileType === 'image') { endpoint = '/send-image'; payload = { phone, image: fileUrl, caption: data.content }; }
                     else if (fileType === 'audio') { endpoint = '/send-audio'; payload = { phone, audio: fileUrl }; }
                     else if (fileType === 'video') { endpoint = '/send-video'; payload = { phone, video: fileUrl, caption: data.content }; }
 
-                    await axios.post(`${ZAPI_BASE_URL}${endpoint}`, payload, { headers }).catch(e => console.error("Erro envio mídia Z-API:", e.message));
+                    await axios.post(`${ZAPI_BASE_URL}${endpoint}`, payload, { headers }).catch(e => console.error("Erro Z-API mídia:", e.message));
                 }
             } else if (data.content) {
-                await axios.post(`${ZAPI_BASE_URL}/send-text`, { phone, message: data.content }, { headers }).catch(e => console.error("Erro envio texto Z-API:", e.message));
+                await axios.post(`${ZAPI_BASE_URL}/send-text`, { phone, message: data.content }, { headers }).catch(e => console.error("Erro Z-API texto:", e.message));
             }
         }
-    } catch (error) { console.error("Erro Webhook Chatwoot:", error.message); }
+    } catch (error) { console.error("Erro Chatwoot:", error.message); }
 });
 
-app.get('/', (req, res) => res.send('Middleware v12 (Fix Labels Race Condition) Online'));
+app.get('/', (req, res) => res.send('Middleware v13 (Fix Loop & Labels) Online'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
