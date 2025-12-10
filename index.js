@@ -23,7 +23,7 @@ const ZAPI_TOKEN = (process.env.ZAPI_TOKEN || "").trim();
 const ZAPI_CLIENT_TOKEN = (process.env.ZAPI_CLIENT_TOKEN || "").trim();
 const ZAPI_BASE_URL = `https://api.z-api.io/instances/${ZAPI_INSTANCE_ID}/token/${ZAPI_TOKEN}`;
 
-// Função auxiliar para pausas (evita race conditions)
+// Função auxiliar para pausas
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // =======================================================================
@@ -35,10 +35,7 @@ app.post('/webhook/zapi', async (req, res) => {
     try {
         const data = req.body;
         
-        // [CORREÇÃO CRÍTICA DO LOOP]
-        // data.fromMe: Ignora mensagens enviadas pelo próprio número (o eco)
-        // data.isGroup: Ignora mensagens de grupo
-        // data.type: Aceita apenas mensagens de callback recebidas
+        // Filtros de segurança e loop
         if (data.fromMe || data.type !== 'ReceivedCallback' || data.isGroup) return;
 
         const phone = data.phone;
@@ -49,7 +46,7 @@ app.post('/webhook/zapi', async (req, res) => {
         let attachmentName = 'file.bin';
         let attachmentMime = 'application/octet-stream'; 
 
-        // --- DETECÇÃO AVANÇADA DE TIPO ---
+        // --- DETECÇÃO DE TIPO ---
         if (data.text) {
             textContent = (typeof data.text === 'string') ? data.text : data.text.message;
         } 
@@ -82,7 +79,7 @@ app.post('/webhook/zapi', async (req, res) => {
 
         let finalSourceId = null;
 
-        // Lógica de Contato: Busca ou Cria
+        // Lógica de Contato
         try {
             const createRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts`, {
                 inbox_id: CHATWOOT_INBOX_ID, name: senderName, phone_number: `+${phone}`
@@ -101,31 +98,40 @@ app.post('/webhook/zapi', async (req, res) => {
 
         if (!finalSourceId) return;
 
-        // 1. GARANTE A CONVERSA ABERTA
+        // 1. GARANTE A CONVERSA
         const convRes = await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations`, {
             source_id: finalSourceId, inbox_id: CHATWOOT_INBOX_ID, status: 'open'
         }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
 
         const conversationId = convRes.data.id;
 
-        // 2. APLICA ETIQUETA COM DELAY (Correção de Race Condition)
+        // 2. APLICA ETIQUETA (OTIMIZADO)
         try {
             const currentLabels = convRes.data.labels || [];
+            
+            // Verifica se deve ser atendido por IA
             const isHumanAttendance = currentLabels.includes('agente-off') || currentLabels.includes('gestor');
+            
+            // Verifica se JÁ POSSUI a etiqueta (para não aplicar de novo e economizar tempo)
+            const hasTriggerLabel = currentLabels.includes('testando-agente');
 
-            if (!isHumanAttendance) {
-                // Se não tem etiquetas restritivas, adiciona a etiqueta de gatilho do n8n
+            if (!isHumanAttendance && !hasTriggerLabel) {
+                // SÓ entra aqui se for a primeira mensagem ou se a etiqueta sumiu
+                console.log(`🏷️ Aplicando etiqueta na conversa ${conversationId}...`);
+                
                 await axios.post(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/labels`, {
                     labels: [...currentLabels, "testando-agente"] 
                 }, { headers: { 'api_access_token': CHATWOOT_TOKEN } });
                 
-                console.log(`🏷️ Etiqueta 'testando-agente' aplicada na conversa ${conversationId}`);
-                
-                // Delay para garantir que o banco processe a etiqueta antes de enviar a mensagem
+                // Delay necessário APENAS quando aplicamos a etiqueta agora
                 await delay(500); 
+            } else {
+                // Fluxo rápido: Etiqueta já existe ou é atendimento humano
+                // console.log("⚡ Fluxo rápido (sem delay de etiqueta)");
             }
+
         } catch (labelErr) {
-            console.error("⚠️ Erro ao aplicar etiquetas:", labelErr.message);
+            console.error("⚠️ Erro labels:", labelErr.message);
         }
 
         // 3. ENVIA A MENSAGEM
@@ -201,6 +207,6 @@ app.post('/webhook/chatwoot', async (req, res) => {
     } catch (error) { console.error("Erro Chatwoot:", error.message); }
 });
 
-app.get('/', (req, res) => res.send('Middleware v13 (Fix Loop & Labels) Online'));
+app.get('/', (req, res) => res.send('Middleware v14 (Optimized Speed) Online'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
